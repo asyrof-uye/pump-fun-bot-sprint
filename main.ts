@@ -1,18 +1,29 @@
-// Pump.fun Bot Sprint — momentum bot for agent-fun/replay/v2.
+// Pump.fun Bot Sprint — fee-aware minimal-trade bot for agent-fun/replay/v2.
 //
 // Strategy (deterministic, no clock, no randomness, no I/O beyond stdin/stdout):
-//   * Snipe launches: buy in a coin's first 8 slots, only when real SOL has
-//     already reached >= 1 SOL, at least 2 distinct buyers are in, the opening
-//     tape is net buying, no single buyer dominates, and the creator's own buy
-//     is modest (<= 2 SOL) and the creator has not sold.
-//   * Cut losers fast at -7%. Bank half at +20% and let the rest ride a trailing
-//     stop (12% below the peak once up 20%) so a rare runner that completes pays
-//     for the losers. Hard 600-slot hold limit; exit at once on a creator sell
-//     or a single >= 1.5 SOL sell.
-//   * Risk controls: at most 5 open positions, 0.06 SOL per coin, at most 2
-//     entries per coin, 240-slot cooldown after an exit, and a deterministic
-//     pace relaxation (from block time only) so the guardrail of >= 20 distinct
-//     coins with >= 0.01 SOL round trips is met even on a quiet tape.
+//   * FEWER, HIGHER-CONVICTION ENTRIES. v2 (the held entry) traded 229 coins and
+//     lost -0.33 SOL: gross trading PnL was ~0 and fees (0.35 SOL) were most of
+//     the loss. This variant attacks the fee problem directly: it only enters
+//     the strongest launches (real SOL >= 5, >= 6 distinct buyers in the first
+//     slots, net buying, no single buyer over 50%, creator buy <= 1 SOL, no
+//     creator sell) and only ONE entry per coin. On the dev window that is
+//     ~90 coins instead of ~230, so fee burn roughly halves. No pace-relaxation
+//     tiers: weak late-window entries are exactly the fee burn this variant
+//     removes (the >= 20-coin guardrail is still met 4x over).
+//   * SELL INTO THE SPIKE, THEN STOP. Dev-window analysis: half of all coins
+//     never rise above their early price, and the coins that do spike dump
+//     fast (median hold-to-end multiple 0.89). Longer holds and looser trailing
+//     stops LOSE money on this window; the winning shape is a hard take-profit:
+//     sell everything at +25%, cut losers at -7%, 300-slot hold cap, exit at
+//     once on a creator sell or a single >= 1.5 SOL sell. No partial banking,
+//     no trailing stop: two fills per round trip, not three.
+//   * Entry timing: decide from age 1 (one slot of tape past creation confirms
+//     real buying; age 0 is mostly the creator's own trade). Order fills ~2
+//     slots later (harness latency), so the honest entry price is the price a
+//     couple of slots after the decision, not the create price.
+//   * Risk controls: at most 5 open positions, 0.10 SOL per coin (capped by
+//     the harness 1%-of-real-reserve order cap), 240-slot cooldown after an
+//     exit, 300-slot hold limit.
 //
 // Wire protocol: the harness sends NDJSON on stdin (hello, batch..., done); the bot
 // answers exactly one reply line per batch on stdout, echoing its seq. Price is
@@ -24,39 +35,27 @@ import * as readline from 'node:readline';
 const LAMPORTS_PER_SOL = 1_000_000_000n;
 const SOL = (x: number): bigint => BigInt(Math.round(x * 1e9));
 
-// ---- tunables (v2: sniper + tight stop + runner tail) ----------------------
-// v1 defect: momentum entry bought AFTER a +4% run-up in 40 slots — on pump.fun
-// that is usually the top; losers then bled to the -12% stop while winners were
-// capped at +30%. Dev: -1.88 SOL, win rate 19%. v2 flips the entry to the launch
-// itself (age 0-8 slots, distributed early buying, modest dev buy), cuts losers
-// fast at -7%, banks half at +20% and lets the rest ride a trailing stop so the
-// rare runner that completes pays for the losers.
+// ---- tunables (v3: fee-aware minimal-trade, hard take-profit) --------------
 const WINDOW_SLOTS = 40;
-const MIN_BUYERS = 3;
-const MAX_TOP_SHARE = 0.6;
-const MIN_RQ_SOL = 2.0;
+const MIN_BUYERS = 6;
+const MAX_TOP_SHARE = 0.5;
+const MIN_RQ_SOL = 5.0;
 const MAX_RQ_SOL = 80;
 const MAX_DEV_BUY_SOL = 1.0;
-const MIN_AGE = 0;
+const MIN_AGE = 1;
 const MAX_AGE = 5;
-const STAKE = SOL(0.06);
+const STAKE = SOL(0.10);
 const MIN_BUY = SOL(0.01);
-const TP_HALF_RATIO = 1.3;
+const TP_HARD_RATIO = 1.25;
 const SL_RATIO = 0.93;
-const TRAIL_ARM = 1.3;
-const TRAIL_KEEP = 0.85;
-const MAX_HOLD_SLOTS = 120;
+const MAX_HOLD_SLOTS = 300;
 const COOLDOWN_SLOTS = 240;
-const MAX_ENTRIES = 2;
+const MAX_ENTRIES = 1;
 const BIG_SELL_SOL = 1.5;
 const BUY_SLIP_BPS = 2000;
 const SELL_SLIP_BPS = 10000;
 const PRUNE_AFTER_SLOTS = 7200;
 const TAPE_KEEP_SLOTS = 240;
-
-// Relaxed entry tiers, keyed on block-time pace (deterministic, from the tape).
-const RELAX_1_AFTER_SEC = 1800;
-const RELAX_2_AFTER_SEC = 3600;
 
 // ---- types -----------------------------------------------------------------
 type Mint = string;
@@ -87,8 +86,6 @@ interface Coin {
   lastExitSlot: number;
   buySlot: number;
   lastBuyPrice: number;
-  tookPartial: boolean;
-  peak: number;
   lastSeenSlot: number;
 }
 
@@ -121,8 +118,6 @@ let nextClient = 1;
 let hello: Hello | null = null;
 let cash = 0n;
 let positions = new Map<Mint, { tokens: bigint; cost: bigint }>();
-let firstBlockTime = -1;
-let lastBlockTime = -1;
 let batchesSeen = 0;
 
 function txFee(): bigint {
@@ -190,8 +185,6 @@ function getCoin(mint: Mint): Coin {
       lastExitSlot: -1e9,
       buySlot: 0,
       lastBuyPrice: 0,
-      tookPartial: false,
-      peak: 0,
       lastSeenSlot: 0,
     };
     coins.set(mint, c);
@@ -256,15 +249,6 @@ function windowStats(c: Coin, slot: number): {
   };
 }
 
-// Pace tier from block time: 0 = normal, 1 = relaxed, 2 = very relaxed.
-function paceTier(): number {
-  if (firstBlockTime < 0 || lastBlockTime < firstBlockTime) return 0;
-  const elapsed = lastBlockTime - firstBlockTime;
-  if (elapsed >= RELAX_2_AFTER_SEC && boughtMints.size < 6) return 2;
-  if (elapsed >= RELAX_1_AFTER_SEC && boughtMints.size < 3) return 1;
-  return 0;
-}
-
 interface Order {
   side: 'buy' | 'sell';
   client_id: string;
@@ -291,8 +275,6 @@ function applyBatch(batch: any): void {
       if (c) {
         c.buySlot = p.decidedSlot;
         c.lastBuyPrice = p.price;
-        c.tookPartial = false;
-        c.peak = 0;
         c.entries += 1;
         boughtMints.add(p.mint);
       }
@@ -319,10 +301,6 @@ function applyBatch(batch: any): void {
   }
 
   for (const e of batch.events as any[]) {
-    if (typeof e.block_time === 'number') {
-      if (firstBlockTime < 0) firstBlockTime = e.block_time;
-      lastBlockTime = e.block_time;
-    }
     const c = getCoin(e.mint);
     c.lastSeenSlot = slot;
     if (e.event === 'CreateEvent') {
@@ -369,9 +347,6 @@ function applyBatch(batch: any): void {
 function decideOrders(batch: any): Order[] {
   const slot: number = batch.slot;
   const orders: Order[] = [];
-  const tier = paceTier();
-  const minBuyers = tier === 2 ? 1 : MIN_BUYERS;
-  const minRq = tier === 2 ? 0.5 : MIN_RQ_SOL;
   const tx = txFee();
   let free = freeCash();
   let openSlots = hello!.caps.max_open_positions - committedPositions();
@@ -393,7 +368,7 @@ function decideOrders(batch: any): Order[] {
     }
   }
 
-  // ---- exits first ---------------------------------------------------------
+  // ---- exits first: hard take-profit, stop-loss, hold cap, danger signals --
   for (const [mint, pos] of positions) {
     const c = coins.get(mint);
     if (!c || c.complete) continue;
@@ -402,27 +377,9 @@ function decideOrders(batch: any): Order[] {
     const value = positionValueLamports(mint);
     if (value <= 0n || pos.cost <= 0n) continue;
     const ratio = Number(value) / Number(pos.cost);
-    if (ratio >= TRAIL_ARM && ratio > c.peak) c.peak = ratio;
-    // Bank half once up 20%: the rest rides the trailing stop.
-    if (!c.tookPartial && ratio >= TP_HALF_RATIO) {
-      const half = pos.tokens / 2n;
-      if (half > 0n) {
-        const id = newClientId();
-        orders.push({
-          side: 'sell',
-          client_id: id,
-          mint,
-          token_amount: half.toString(),
-          max_slippage_bps: SELL_SLIP_BPS,
-        });
-        pending.set(id, { side: 'sell', mint, decidedSlot: slot, price: priceOf(c), amount: half });
-        c.tookPartial = true;
-        continue;
-      }
-    }
     let exit = false;
-    if (ratio <= SL_RATIO) exit = true;
-    else if (c.peak > 0 && ratio <= c.peak * TRAIL_KEEP) exit = true;
+    if (ratio >= TP_HARD_RATIO) exit = true;
+    else if (ratio <= SL_RATIO) exit = true;
     else if (slot - c.buySlot >= MAX_HOLD_SLOTS) exit = true;
     else if (creatorSoldNow.has(mint)) exit = true;
     else if (bigSellNow.has(mint)) exit = true;
@@ -437,10 +394,9 @@ function decideOrders(batch: any): Order[] {
     });
     pending.set(id, { side: 'sell', mint, decidedSlot: slot, price: priceOf(c), amount: pos.tokens });
     c.lastExitSlot = slot;
-    c.peak = 0;
   }
 
-  // ---- new entries (launch sniper) -----------------------------------------
+  // ---- new entries: only the strongest launches, one entry per coin -------
   for (const mint of eventMints) {
     if (orders.length >= hello!.caps.max_orders_per_batch) break;
     if (openSlots <= 0) break;
@@ -453,13 +409,13 @@ function decideOrders(batch: any): Order[] {
     const age = slot - c.createdSlot;
     if (age < MIN_AGE || age > MAX_AGE) continue;
     const rqSol = Number(c.rQuote) / 1e9;
-    if (rqSol < minRq || rqSol > MAX_RQ_SOL) continue;
+    if (rqSol < MIN_RQ_SOL || rqSol > MAX_RQ_SOL) continue;
     if (c.creatorSold) continue;
     if (c.devBuySol > MAX_DEV_BUY_SOL) continue;
     const price = priceOf(c);
     if (price <= 0) continue;
     const stats = windowStats(c, slot);
-    if (stats.buyers < minBuyers) continue;
+    if (stats.buyers < MIN_BUYERS) continue;
     if (stats.netSol < 0) continue; // the opening tape must be net buying
     if (stats.topShare > MAX_TOP_SHARE) continue;
     const cap = maxBuyLamports(c);
